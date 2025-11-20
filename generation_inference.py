@@ -26,7 +26,8 @@ import os
 import PIL.Image
 
 # specify the path to the model
-model_path = "deepseek-ai/Janus-1.3B"
+# model_path = "deepseek-ai/Janus-1.3B"
+model_path = "/home/vlgd/Models/Janus-Pro-1B/"
 vl_chat_processor: VLChatProcessor = VLChatProcessor.from_pretrained(model_path)
 tokenizer = vl_chat_processor.tokenizer
 
@@ -57,7 +58,7 @@ def generate(
     vl_chat_processor: VLChatProcessor,
     prompt: str,
     temperature: float = 1,
-    parallel_size: int = 16,
+    parallel_size: int = 1,
     cfg_weight: float = 5,
     image_token_num_per_image: int = 576,
     img_size: int = 384,
@@ -113,4 +114,6 @@ generate(
     vl_gpt,
     vl_chat_processor,
     prompt,
+    # image_token_num_per_image = 576,
+    # img_size = 256,
 )

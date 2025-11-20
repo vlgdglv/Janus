@@ -1,3 +1,9 @@
+assets/
+generated_samples_with_probe/
+parrallel_test/
+probe_runtime/
+
+
 ##### Python.gitignore #####
 # Byte-compiled / optimized / DLL files
 **/__pycache__/
