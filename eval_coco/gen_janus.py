@@ -107,7 +107,7 @@ def parse_args():
 
     # model
     p.add_argument("--model_path",    type=str,
-                   default="/home/vlgd/Models/Janus-Pro-1B/")
+                   default="/jizhicfs/pkuhetu/bht/model_home/Janus-Pro-7B/")
 
     # method
     p.add_argument("--method",        type=str,  default="sjd",

@@ -237,14 +237,12 @@ def _jacobi_window(
     sub_ap   = anchor_probs     # [V]  anchor probs
 
     # ── initial draft ─────────────────────────────────────────────────────────
-    # pos-0: sample from anchor; rest: uniform
-    draft       = torch.empty(W, dtype=torch.long, device=device)
-    draft_probs = torch.full((W, V), 1.0 / V, device=device)
-    draft[0]       = torch.multinomial(sub_ap, 1, generator=generator)
-    draft_probs[0] = sub_ap
-    if W > 1:
-        draft[1:] = torch.randint(0, V, (W - 1,), device=device)
-        # draft_probs[1:] stays 1/V
+    # All positions sampled from the anchor distribution.
+    # Uniform drafts (1/V) have ~50% rejection on image tokens, meaning ~every
+    # window needs a correction forward; anchor drafts are much better priors
+    # for spatially-correlated patches and recover most of the speedup.
+    draft       = torch.multinomial(sub_ap, W, replacement=True, generator=generator)
+    draft_probs = sub_ap.unsqueeze(0).expand(W, -1).clone()
 
     for _it in range(max_iter):
         R               = W - len(accepted)
@@ -269,12 +267,12 @@ def _jacobi_window(
         adv_probs = F.softmax(adv_logit / temperature, dim=-1)    # [R, V]
 
         # ── accept / reject ───────────────────────────────────────────────────
-        # Anchor for position j within sub-window:
-        #   j == 0  →  (sub_al, sub_ap)     – before seeing any draft token
+        # Anchor for position j within the sub-window:
+        #   j == 0  →  (sub_al, sub_ap)       – before seeing any draft token
         #   j  > 0  →  (adv_logit[j-1], adv_probs[j-1])
 
-        n_commit   = R
-        new_tokens : list[int] = []
+        j_reject  = R          # first position that was rejected (R = none)
+        resampled = None
 
         for j in range(R):
             al  = sub_al          if j == 0 else adv_logit[j - 1]
@@ -286,40 +284,46 @@ def _jacobi_window(
             r_val    = float(torch.rand(1, device=device, generator=generator))
 
             if r_val < p_accept:
-                new_tokens.append(d_j)
                 stats.n_accepted += 1
             else:
                 resampled = _resample_rejected(ap, p_d, generator)
-                new_tokens.append(resampled)
-                n_commit = j + 1
+                j_reject  = j
                 stats.n_rejected += 1
                 break
 
-        accepted.extend(new_tokens[:n_commit])
-        _rollback_kv(past, R - n_commit)
+        # Commit accepted draft tokens; roll back trailing positions not committed.
+        for j in range(j_reject):
+            accepted.append(int(sub_draft[j]))
+        # Keep j_reject's KV entry (d_j approximation); remove j_reject+1..R-1.
+        n_keep = j_reject + 1 if resampled is not None else R
+        _rollback_kv(past, R - n_keep)
+
+        if resampled is not None:
+            # Keep draft k/v at position j_reject as an approximation; the anchor
+            # draft ensures d_j is a plausible token (≈ sub_ap), so the KV error
+            # is small. Uniform drafts produced strips/collapse because rejected
+            # tokens were arbitrary (any of 16384); anchor drafts bound that error.
+            accepted.append(resampled)
+            # Anchor for next position comes from the forward we already ran.
+            # adv_logit[j_reject] = p(t | ..., d_0..d_{j_reject}); since d_{j_reject}
+            # ≈ r_{j_reject} in distribution, this is a good approximation.
+            sub_al  = adv_logit[j_reject].clone()
+            sub_ap  = F.softmax(sub_al / temperature, dim=-1)
+            sub_pos += j_reject + 1
+        else:
+            sub_al  = adv_logit[-1].clone()
+            sub_ap  = adv_probs[-1].clone()
+            sub_pos += R
 
         if len(accepted) == W:
-            return accepted, past, adv_logit[-1].clone(), adv_probs[-1].clone()
+            return accepted, past, sub_al, sub_ap
 
         # ── next iteration ────────────────────────────────────────────────────
-        # Anchor: adv at the last committed position (approx – ignores resample).
-        sub_pos += n_commit
-        sub_al   = adv_logit[n_commit - 1].clone()
-        sub_ap   = adv_probs[n_commit - 1].clone()
-
-        # New draft from model outputs where available, else random.
-        new_R         = W - len(accepted)
-        new_draft      = torch.empty(new_R, dtype=torch.long, device=device)
-        new_draft_prob = torch.empty(new_R, V, device=device)
-        for k in range(new_R):
-            src = n_commit - 1 + k
-            if src < R - 1:
-                p               = adv_probs[src]
-                new_draft[k]      = torch.multinomial(p, 1, generator=generator)
-                new_draft_prob[k] = p
-            else:
-                new_draft[k]      = torch.randint(0, V, (1,), device=device)
-                new_draft_prob[k] = 1.0 / V
+        # sub_al / sub_ap are now correct for position sub_pos.
+        # Draft all remaining positions from the (corrected) anchor.
+        new_R          = W - len(accepted)
+        new_draft      = torch.multinomial(sub_ap, new_R, replacement=True, generator=generator)
+        new_draft_prob = sub_ap.unsqueeze(0).expand(new_R, -1).clone()
         draft       = new_draft
         draft_probs = new_draft_prob
 

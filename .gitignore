@@ -4,6 +4,7 @@ parallel_test/
 probe_runtime/
 generated/
 eval_coco/data/
+inference_outputs/
 *.ipynb
 ##### Python.gitignore #####
 # Byte-compiled / optimized / DLL files
