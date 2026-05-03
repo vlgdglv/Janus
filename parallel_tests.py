@@ -53,6 +53,7 @@ image_token_num_per_image = 576
 H, W = 24, 24
 
 q_image_content_conditions = [
+    # "A black Honda motorcycle parked in front of a garage.",
     'A close-up high-contrast photo of Sydney Opera House sitting next to Eiffel tower, under a blue night sky of roiling energy, exploding yellow stars, and radiating swirls of blue.',
     'close-up two birds on a tree branch, background of blue sky with cumulus clouds and rising sun, 4k, realistic',
     'Three penguins in yellow construction helmets, building a sandcastle on a tropical beach, one holding a blueprint, the ocean behind them glowing in soft blue hues under the setting sun, hyperrealistic textures, playful and cinematic',
@@ -99,18 +100,20 @@ def slugify_first_words(text: str, n=6) -> str:
     return base or "img"
 
 @torch.inference_mode()
-def baseline_gt_logits(mm, proc, prompt, H, W, cfg_weight=5.0, temperature=1.0):
+def baseline_gt_logits(mm, proc, prompt, H, W, cfg_weight=5.0, temperature=1.0, do_sample=True):
     tok = proc.tokenizer
     ids = torch.LongTensor(tok.encode(prompt)).to("cuda")
     toks = torch.stack([ids, ids]).to("cuda")
     toks[1, 1:-1] = proc.pad_id
-
+    
     inp = mm.language_model.get_input_embeddings()(toks)
     T = H * W
     gt_tokens, gt_logits = [], []
     probs_all = []
     generated_tokens = torch.zeros((T), dtype=torch.int).cuda()
     
+    g = torch.Generator(device="cuda")
+    g.manual_seed(42)
 
     past = None
     for t in range(T):
@@ -120,15 +123,14 @@ def baseline_gt_logits(mm, proc, prompt, H, W, cfg_weight=5.0, temperature=1.0):
         log_all = mm.gen_head(hs)
         
         log = log_all[1:2] + cfg_weight * (log_all[0:1] - log_all[1:2])
-        
-        gt_logits.append(log.squeeze(0).detach().cpu())
-
         probs = torch.softmax(log / temperature, dim=-1)
         probs_all.append(probs.squeeze().float().detach().cpu())
-
-        nxt = torch.multinomial(probs, num_samples=1)
-        
-        # nxt = log.argmax(dim=-1, keepdim=True)
+    
+        if do_sample:
+            nxt = torch.multinomial(probs, num_samples=1, generator=g)
+        else:
+            nxt = probs.argmax(dim=-1, keepdim=True)
+            
         generated_tokens[t] = nxt
         gt_tokens.append(int(nxt))
         both = torch.cat([nxt, nxt], dim=0).view(-1)
@@ -138,7 +140,7 @@ def baseline_gt_logits(mm, proc, prompt, H, W, cfg_weight=5.0, temperature=1.0):
     return generated_tokens, probs_all
 
 def cfg_merge(log_all, cfg_weight=5.0):
-    return log_all[0:1] + cfg_weight * (log_all[0:1] - log_all[1:2])
+    return log_all[1:2] + cfg_weight * (log_all[0:1] - log_all[1:2])
 
 def _raster_idx(L0: int, W: int, r: int, c: int) -> int:
     return L0 + r * W + c
@@ -188,10 +190,9 @@ def _build_visible_indices_for_column(L0, W, i, c, policy="row_prefix", neighbor
 def baseline_row_parallel_logits(
     mm, proc, prompt, H, W,
     cfg_weight=5.0, temperature=1.0,
-    row_parallel=True,
+    ar_row=1, do_sample: bool = True,
     mask_policy: str = "row_prefix",
     neighbor_k: int = 0,
-    mask_is_bool: bool = True,
 ):
     device = next(mm.language_model.parameters()).device
 
@@ -211,10 +212,11 @@ def baseline_row_parallel_logits(
     past = None
     pos_cur = L_prefill
     prev_row_embs = []
-    
-    x_row = 1
 
-    for c in range(W * x_row):
+    g = torch.Generator(device="cuda")
+    g.manual_seed(42)
+    
+    for c in range(W * ar_row):
         out = mm.language_model.model(
             inputs_embeds=inp,
             use_cache=True,
@@ -223,11 +225,15 @@ def baseline_row_parallel_logits(
         hs, past = out.last_hidden_state, out.past_key_values
         last_h = hs[:, -1, :]                           # [2, D]
         log = cfg_merge(mm.gen_head(last_h), cfg_weight).squeeze(0) # [V]
-        
-        probs = F.softmax(log / temperature, dim=-1)
+       
+        probs = torch.softmax(log / temperature, dim=-1)
         probs_all.append(probs.squeeze().float().detach().cpu())
 
-        nxt = torch.multinomial(probs, num_samples=1).squeeze(0) # generator=g
+        if do_sample:
+            nxt = torch.multinomial(probs, num_samples=1, generator=g).squeeze(0) # generator=g
+        else:
+            nxt = probs.argmax(dim=-1, keepdim=True)
+
         token_id = int(nxt)
         generated_tokens[0 * W + c] = token_id
         gt_tokens.append(token_id)
@@ -242,12 +248,9 @@ def baseline_row_parallel_logits(
     prev_row_embs = prev_row_embs[-W:]
     prev_row_embs.insert(0, prev_row_embs.pop())
 
-    for r in range(x_row, H):
+    for r in range(ar_row, H):
         # T_k = past[0][0].shape[2]
-        T_k = L_prefill + r * W
-        pos_base = T_k      
-        K_total = T_k + W
-
+        pos_base = L_prefill + r * W
         
         # Just use default attention mask
         # attn_mask = torch.full((2, 1, W, K_total), torch.finfo(torch.float16).min, device=device) #
@@ -258,7 +261,7 @@ def baseline_row_parallel_logits(
         #         attn_mask[0, 0, c, idx] = 0.0
         #         attn_mask[1, 0, c, idx] = 0.0
 
-        for _ in range(0):
+        for _ in range(3):
             row_cond = torch.stack(prev_row_embs, dim=0).to(device)          # [W, D]
             step_emb = torch.stack([row_cond, row_cond], dim=0).contiguous() # [2, W, D]
             pos_ids = (torch.arange(W, device=device, dtype=torch.long) + pos_base).unsqueeze(0).expand(2, -1)
@@ -272,7 +275,7 @@ def baseline_row_parallel_logits(
 
             log_q = cfg_merge(mm.gen_head(out_prop.last_hidden_state), cfg_weight).squeeze(0)
             q_probs  = F.softmax(log_q / temperature, dim=-1)         # [W, V]
-            proposal = torch.multinomial(q_probs, 1).squeeze(-1)      # [W]
+            proposal = torch.multinomial(q_probs, 1, generator=g).squeeze(-1)      # [W]
             prev_row_embs = list(mm.prepare_gen_img_embeds(proposal.unsqueeze(0).expand(2, -1))[0].unbind(dim=0))
             prev_row_embs.insert(0, prev_row_embs.pop())
 
@@ -287,11 +290,19 @@ def baseline_row_parallel_logits(
             use_cache=True
         )
         log_q = cfg_merge(mm.gen_head(out_prop.last_hidden_state), cfg_weight).squeeze(0)
-        q_probs  = F.softmax(log_q / (temperature), dim=-1)         # [W, V]
+        # log_q = mm.gen_head(out_prop.last_hidden_state)
+        # log_q = log_q[1:2] + cfg_weight * (log_q[0:1] - log_q[1:2])
+        # log_q = log_q.squeeze(0)
+
+        q_probs  = F.softmax(log_q / (temperature), dim=-1)   
+        for prob in q_probs:
+            probs_all.append(prob.float().detach().cpu())
+
+        if do_sample:      # [W, V]
+            proposal = torch.multinomial(q_probs, 1, generator=g).squeeze(-1)      # [W]
+        else:
+            proposal = q_probs.argmax(dim=-1)
         
-        for log in log_q:
-            probs_all.append(log.float().detach().cpu())
-        proposal = torch.multinomial(q_probs, 1).squeeze(-1)      # [W]
         prev_row_embs = list(mm.prepare_gen_img_embeds(proposal.unsqueeze(0).expand(2, -1))[0].unbind(dim=0))
 
         final_row = proposal.clone()
@@ -490,6 +501,374 @@ def spec_row_parallel_logits(
     print(probe_ctx)
     return generated_tokens
 
+@torch.inference_mode()
+def partial_row_parallel_logits(
+    mm, proc, prompt, H, W,
+    cfg_weight=5.0, temperature=1.0,
+    row_batch_size: int = 8,
+):
+    device = next(mm.language_model.parameters()).device
+
+    tok = proc.tokenizer
+    ids = torch.LongTensor(tok.encode(prompt)).to("cuda")
+    
+    toks = torch.stack([ids, ids]).to("cuda")
+    toks[1, 1:-1] = proc.pad_id
+
+    inp = mm.language_model.get_input_embeddings()(toks)
+    L_prefill = inp.shape[1]
+
+    T = H * W
+    gt_tokens, probs_all = [], []
+    generated_tokens = torch.zeros((T), dtype=torch.int64, device="cuda")
+
+    past = None
+    pos_cur = L_prefill
+    prev_row_embs = []
+    
+    x_row = 1
+
+    g = torch.Generator(device="cuda")
+    g.manual_seed(42)
+
+    for c in range(W * x_row):
+        out = mm.language_model.model(
+            inputs_embeds=inp,
+            use_cache=True,
+            past_key_values=past,
+        )
+        hs, past = out.last_hidden_state, out.past_key_values
+        last_h = hs[:, -1, :]                           # [2, D]
+        log = cfg_merge(mm.gen_head(last_h), cfg_weight).squeeze(0) # [V]
+        
+        probs = F.softmax(log / temperature, dim=-1)
+        probs_all.append(probs.squeeze().float().detach().cpu())
+
+        nxt = torch.multinomial(probs, num_samples=1, generator=g).squeeze(0) # generator=g
+        token_id = int(nxt)
+        generated_tokens[0 * W + c] = token_id
+        gt_tokens.append(token_id)
+
+        both = torch.tensor([token_id, token_id], device="cuda").view(-1)
+        img_emb = mm.prepare_gen_img_embeds(both)       # [2, D]
+        prev_row_embs.append(img_emb[0].detach())       # [D]
+
+        inp = img_emb.unsqueeze(1)                      # [2,1,D]
+        pos_cur += 1
+
+
+    prev_row_embs = prev_row_embs[-row_batch_size:]
+    prev_row_embs.insert(0, prev_row_embs.pop())
+
+    
+    row_fwd_count = W // row_batch_size if W % row_batch_size == 0 else W // row_batch_size + 1
+    for r in range(x_row, H):
+        pos_base = L_prefill + r * W   
+        
+        for rf in range(row_fwd_count):
+            row_cond = torch.stack(prev_row_embs, dim=0).to(device)          # [W, D]
+            step_emb = torch.stack([row_cond, row_cond], dim=0).contiguous() # [2, W, D]
+            pos_ids = (torch.arange(row_batch_size, device=device, dtype=torch.long) + pos_base + rf * row_batch_size).unsqueeze(0).expand(2, -1)
+            out_prop = mm.language_model.model(
+                inputs_embeds=step_emb,
+                past_key_values=past,
+                position_ids=pos_ids,
+                use_cache=True
+            )
+            past = out_prop.past_key_values
+            log_q = cfg_merge(mm.gen_head(out_prop.last_hidden_state), cfg_weight).squeeze(0)
+            q_probs  = F.softmax(log_q / (temperature), dim=-1)         # [W, V]
+            
+            proposal = torch.multinomial(q_probs, 1, generator=g).squeeze(-1)      # [W]
+            prev_row_embs = list(mm.prepare_gen_img_embeds(proposal.unsqueeze(0).expand(2, -1))[0].unbind(dim=0))
+
+            final_row = proposal.clone()
+        
+            for c in range(rf * row_batch_size, (rf + 1) * row_batch_size):
+                generated_tokens[r * W + c] = int(final_row[c % row_batch_size])
+            
+            if rf == row_fwd_count - 1 and len(prev_row_embs) > 1:    
+                prev_row_embs.insert(0, prev_row_embs.pop())
+
+    return generated_tokens
+
+
+@torch.inference_mode()
+def row_parallel_experiments(
+    mm, proc, prompt, H, W,
+    cfg_weight=5.0, temperature=1.0,
+    ar_row=1, rp_row=23, do_sample: bool = True,
+): 
+    device = next(mm.language_model.parameters()).device
+    
+    K_NEIGHBORS = 10
+    USE_RANDOM_NEIGHBOR = False
+
+    # dist_np = np.load("probe_runtime/embeddings_dist.npy")
+    # dist = torch.from_numpy(dist_np)
+    # neighbor_idx = torch.argsort(dist, dim=-1)
+    # neighbor_idx_k = neighbor_idx[:, 1:K_NEIGHBORS+1]   
+    # neighbors = neighbor_idx_k.to(device)          # [V, K]
+
+
+    tok = proc.tokenizer
+    ids = torch.LongTensor(tok.encode(prompt)).to("cuda")
+    
+    g = torch.Generator(device="cuda")
+    g.manual_seed(42)
+    
+    toks = torch.stack([ids, ids]).to("cuda")
+    toks[1, 1:-1] = proc.pad_id
+
+    inp = mm.language_model.get_input_embeddings()(toks)
+    L_prefill = inp.shape[1]
+
+    T = H * W
+    gt_tokens, probs_all = [], []
+    generated_tokens = torch.zeros((T), dtype=torch.int64, device="cuda")
+
+    past = None
+    pos_cur = L_prefill
+    prev_row_embs = []
+    
+    TOP_L, TOP_R = 10, 100
+    
+    
+    for c in range(W * ar_row):
+        out = mm.language_model.model(
+            inputs_embeds=inp,
+            use_cache=True,
+            past_key_values=past,
+        )
+        hs, past = out.last_hidden_state, out.past_key_values
+        last_h = hs[:, -1, :]                           # [2, D]
+        log = cfg_merge(mm.gen_head(last_h), cfg_weight).squeeze(0) # [V]
+        
+        probs = torch.softmax(log / temperature, dim=-1)
+        probs_all.append(probs.squeeze().float().detach().cpu())
+
+        if do_sample:
+            if True:
+                nxt = torch.multinomial(probs, num_samples=1, generator=g).squeeze(0) # 
+            if False:
+                probs = probs.unsqueeze(0)
+                top100 = probs.topk(TOP_R, dim=-1).indices              # [T,100]
+                nxt = top100[torch.arange(probs.size(0)), torch.randint(TOP_L, TOP_R, (probs.size(0),))]
+        else:
+            nxt = probs.argmax(dim=-1, keepdim=True)
+        token_id = int(nxt)
+        generated_tokens[W * 0 + c] = token_id
+        gt_tokens.append(token_id)
+
+        both = torch.tensor([token_id, token_id], device="cuda").view(-1)
+        img_emb = mm.prepare_gen_img_embeds(both)       # [2, D]
+        prev_row_embs.append(img_emb[0].detach())       # [D]
+        inp = img_emb.unsqueeze(1)                      # [2,1,D]
+    
+    def top_p_stability_verify(draft_ids, target_logits, p=0.9, temp=1.0):   
+        probs = F.softmax(target_logits / temp, dim=-1) # [B, W, V]
+        draft_probs = torch.gather(probs, -1, draft_ids.unsqueeze(-1)).squeeze(-1) # [B, W]
+        sorted_probs, _ = torch.sort(probs, descending=True, dim=-1)
+        cumsum_probs = torch.cumsum(sorted_probs, dim=-1)        
+        cutoff_index = (cumsum_probs > p).float().argmax(dim=-1) # [B, W]
+        cutoff_prob = torch.gather(sorted_probs, -1, cutoff_index.unsqueeze(-1)).squeeze(-1) # [B, W]
+        is_stable = (draft_probs >= cutoff_prob)
+        new_sampled_ids = torch.multinomial(probs.view(-1, probs.size(-1)), 1).view(draft_ids.shape)
+        final_ids = torch.where(is_stable, draft_ids, new_sampled_ids)
+        convergence_rate = is_stable.float().mean().item()
+        return final_ids, convergence_rate
+    
+    prev_row_embs = prev_row_embs[-W:]
+    prev_row_embs.insert(0, prev_row_embs.pop())
+    row_cond = torch.stack(prev_row_embs)             # [W, D]
+
+    for r in range(ar_row, ar_row+rp_row):
+        pos_base = L_prefill + r * W
+        if False:
+            cand_center = prev_row_embs
+            cand_right = torch.roll(prev_row_embs, shifts=1, dims=0)
+            cand_left = torch.roll(prev_row_embs, shifts=-1, dims=0)
+            
+            candidates_list = [cand_center, cand_right, cand_left]
+            candidates_scores = []
+            
+            for cand_input in candidates_list:
+                cand_input = torch.stack([cand_input, cand_input], dim=0).contiguous()
+                pos_ids = (torch.arange(W, device=device, dtype=torch.long) + pos_base).unsqueeze(0).expand(2, -1)
+                out_prop = mm.language_model.model(
+                    inputs_embeds=cand_input,          # [2, W, D]
+                    past_key_values=_to_cache(past),
+                    position_ids=pos_ids,            # [2, W]
+                    use_cache=True
+                )
+                cand_logits = cfg_merge(mm.gen_head(out_prop.last_hidden_state), cfg_weight).squeeze(0)
+                cand_probs  = F.softmax(cand_logits / temperature, dim=-1)         # [W, V]
+                candidates_scores.append(cand_probs)
+            
+            stacked_probs = torch.stack(candidates_scores, dim=0) 
+            if True:
+                mixed_probs = torch.mean(stacked_probs, dim=0)
+                draft_token_ids = torch.multinomial(mixed_probs, 1).squeeze(-1)
+            if False:
+                epsilon = 1e-8
+                entropy = -torch.sum(stacked_probs * torch.log(stacked_probs + epsilon), dim=-1)
+                weights = F.softmax(-entropy, dim=0)
+                weighted_probs = torch.sum(stacked_probs * weights.unsqueeze(-1), dim=0)
+                draft_token_ids = torch.argmax(weighted_probs, dim=-1)
+            if False:
+                confidence_scores, _ = torch.max(stacked_probs, dim=-1) # [3, W]
+                best_source_idx = torch.argmax(confidence_scores, dim=0) # [W]
+                W, V = stacked_probs.shape[1], stacked_probs.shape[2]
+                gather_idx = best_source_idx.view(1, W, 1).expand(1, W, V)
+                chosen_probs = torch.gather(stacked_probs, 0, gather_idx).squeeze(0) # [W, V]
+                draft_token_ids = torch.argmax(chosen_probs, dim=-1)
+            if False:
+                cand_ids = [torch.argmax(p, dim=-1) for p in candidates_scores] 
+                stacked_ids = torch.stack(cand_ids, dim=0) # [3, W]
+                mode_values, _ = torch.mode(stacked_ids, dim=0) 
+                draft_token_ids = mode_values
+            if False:
+                source_scores, _ = torch.max(stacked_probs, dim=-1) # [3, W]
+                source_selection_probs = F.softmax(source_scores / 0.5, dim=0) # [3, W], 温度控制区分度
+                selected_source = torch.multinomial(source_selection_probs.permute(1, 0), 1).squeeze(-1) # [W]
+                cand_ids = torch.stack([torch.argmax(p, dim=-1) for p in candidates_scores], dim=0) # [3, W]
+                draft_token_ids = torch.gather(cand_ids, 0, selected_source.unsqueeze(0)).squeeze(0)
+                
+            row_cond = mm.prepare_gen_img_embeds(draft_token_ids)
+        
+        
+        for _ in range(1):
+            step_emb = torch.stack([row_cond, row_cond], dim=0).contiguous() # [2, W, D]
+            step_emb = 0.5 * step_emb
+            pos_ids = (torch.arange(W, device=device, dtype=torch.long) + pos_base).unsqueeze(0).expand(2, -1)
+            out_prop = mm.language_model.model(
+                inputs_embeds=step_emb,          # [2, W, D]
+                past_key_values=_to_cache(past),
+                # attention_mask=attn_mask,        # [2, 1, W, T_k+W], 0/-inf
+                position_ids=pos_ids,            # [2, W]
+                use_cache=True
+            )
+
+            log_q = cfg_merge(mm.gen_head(out_prop.last_hidden_state), cfg_weight).squeeze(0)
+            q_probs  = F.softmax(log_q / temperature, dim=-1)         # [W, V]
+            if _>=1:
+                proposal = torch.multinomial(q_probs, 1).squeeze(-1)      # [W]
+            else:
+                proposal = q_probs.argmax(dim=-1)
+            prev_row_embs = list(mm.prepare_gen_img_embeds(proposal.unsqueeze(0).expand(2, -1))[0].unbind(dim=0))
+            prev_row_embs.insert(0, prev_row_embs.pop())
+            row_cond = torch.stack(prev_row_embs, dim=0).to(device)          # [W, D]
+        
+        MAX_ITER = 0
+        prev_ids = None
+        for i in range(MAX_ITER):
+            step_emb = torch.stack([row_cond, row_cond], dim=0).contiguous() # [2, W, D]
+            pos_ids = (torch.arange(W, device=device, dtype=torch.long) + pos_base).unsqueeze(0).expand(2, -1)
+            out_prop = mm.language_model.model(
+                inputs_embeds=step_emb,          # [2, W, D]
+                past_key_values=_to_cache(past),
+                position_ids=pos_ids,            # [2, W]
+                use_cache=True
+            )
+            log_q = cfg_merge(mm.gen_head(out_prop.last_hidden_state), cfg_weight).squeeze(0)
+            if i > 0:
+                current_temp = temperature * (1.0 - i * 0.1)
+                proposal, cr = top_p_stability_verify(prev_ids, log_q, 0.75, current_temp)
+                # print("Iteration: ", i, ", stability: ", cr)
+            else:
+                q_probs  = F.softmax(log_q / temperature, dim=-1)   
+                proposal = torch.multinomial(q_probs, 1).squeeze(-1)  
+            prev_ids = proposal
+            prev_row_embs = list(mm.prepare_gen_img_embeds(proposal.unsqueeze(0).expand(2, -1))[0].unbind(dim=0))
+            prev_row_embs.insert(0, prev_row_embs.pop())
+            row_cond = torch.stack(prev_row_embs, dim=0).to(device)          # [W, D]
+        
+        step_emb = torch.stack([row_cond, row_cond], dim=0).contiguous() # [2, W, D]
+        pos_ids = (torch.arange(W, device=device, dtype=torch.long) + pos_base).unsqueeze(0).expand(2, -1)
+        out_prop = mm.language_model.model(
+            inputs_embeds=step_emb,
+            past_key_values=past,
+            position_ids=pos_ids,            # [2, W]
+            use_cache=True
+        )
+
+        log_q = cfg_merge(mm.gen_head(out_prop.last_hidden_state), cfg_weight).squeeze(0)
+        q_probs  = F.softmax(log_q / temperature, dim=-1)
+        proposal = torch.multinomial(q_probs, 1).squeeze(-1)
+        prev_row_embs = list(mm.prepare_gen_img_embeds(proposal.unsqueeze(0).expand(2, -1))[0].unbind(dim=0))
+        prev_row_embs.insert(0, prev_row_embs.pop())
+        row_cond = torch.stack(prev_row_embs, dim=0).to(device)          # [W, D]
+        
+        # step_emb = torch.stack([row_cond, row_cond], dim=0).contiguous()
+        # pos_ids = (torch.arange(W, device=device, dtype=torch.long) + pos_base).unsqueeze(0).expand(2, -1)
+        # out_prop = mm.language_model.model(
+        #     inputs_embeds=step_emb,
+        #     past_key_values=past,
+        #     position_ids=pos_ids,
+        #     use_cache=True
+        # )
+        # past = out_prop.past_key_values
+        # log_q = cfg_merge(mm.gen_head(out_prop.last_hidden_state), cfg_weight).squeeze(0)
+
+        # q_probs  = F.softmax(log_q / (temperature), dim=-1)   
+        # for prob in q_probs:
+        #     probs_all.append(prob.float().detach().cpu())
+        # if do_sample:      # [W, V]
+        #     if True:
+        #         proposal = torch.multinomial(q_probs, 1, generator=g).squeeze(-1)      # [W]
+        #     if False:
+        #         top100 = q_probs.topk(TOP_R, dim=-1).indices              # [T, 100]
+        #         proposal = top100[torch.arange(q_probs.size(0)), torch.randint(TOP_L, TOP_R, (q_probs.size(0),))]
+        #         if USE_RANDOM_NEIGHBOR:
+        #             rand_idx = torch.randint(
+        #                 0,
+        #                 neighbors.size(1),
+        #                 (proposal.size(0),),
+        #                 generator=g,
+        #                 device=q_probs.device,
+        #             )                                                                # [W]
+        #             proposal = neighbors[proposal, rand_idx]                         # [W]
+        #         else:
+        #             proposal = neighbors[proposal, 0]        
+        # else:
+        #     proposal = q_probs.argmax(dim=-1)
+        # prev_row_embs = mm.prepare_gen_img_embeds(proposal.unsqueeze(0).expand(2, -1))[0]
+        # row_cond = torch.roll(prev_row_embs, shifts=1, dims=0)
+        
+        final_row = proposal.clone()
+        for c in range(W):
+            generated_tokens[r * W + c] = int(final_row[c])
+        # prev_row_embs.insert(0, prev_row_embs.pop())
+
+    inp = prev_row_embs[0].unsqueeze(0)
+    inp = torch.stack([inp, inp], dim=0)
+    for c in range((ar_row+rp_row)*W, H*W):
+        out = mm.language_model.model(
+            inputs_embeds=inp,
+            use_cache=True,
+            past_key_values=past,
+        )
+        hs, past = out.last_hidden_state, out.past_key_values
+        last_h = hs[:, -1, :]                           # [2, D]
+        log = cfg_merge(mm.gen_head(last_h), cfg_weight).squeeze(0) # [V]
+        
+        probs = torch.softmax(log / temperature, dim=-1)
+        probs_all.append(probs.squeeze().float().detach().cpu())
+        if do_sample:
+            nxt = torch.multinomial(probs, num_samples=1, generator=g).squeeze(0) # 
+        else:
+            nxt = probs.argmax(dim=-1, keepdim=True)
+        token_id = int(nxt)
+        generated_tokens[c] = token_id
+        gt_tokens.append(token_id)
+
+        both = torch.tensor([token_id, token_id], device="cuda").view(-1)
+        img_emb = mm.prepare_gen_img_embeds(both)       # [2, D]
+        inp = img_emb.unsqueeze(1)                      # [2,1,D]
+    
+
+    return generated_tokens
+
 
 from contextlib import contextmanager
 @contextmanager
@@ -519,7 +898,7 @@ if __name__ == "__main__":
         img_size=target_size,
         patch_size=patch_size,
     )
-    save_dir = "parrallel_test"
+    save_dir = "parallel_test"
     probe_dir = "probe_runtime"
     images = []
     baseline_prob, row_parallel_prob = [], []
@@ -533,15 +912,18 @@ if __name__ == "__main__":
 
         t0 = time.perf_counter()
         
-        # generated_tokens, bs_probs_all = baseline_gt_logits(vl_gpt, vl_chat_processor, prompt, H, W, cfg_weight=3.0, temperature=1.0)
+        # generated_tokens, bs_probs_all = baseline_gt_logits(vl_gpt, vl_chat_processor, prompt, H, W, cfg_weight=3.0, temperature=1.0, do_sample=True)
         # baseline_token.append(generated_tokens.detach().cpu().numpy())
-        generated_tokens, pl_probs_all = baseline_row_parallel_logits(vl_gpt, vl_chat_processor, prompt, H, W, row_parallel=True, cfg_weight=3.0, temperature=1.0)
+        # generated_tokens, pl_probs_all = baseline_row_parallel_logits(vl_gpt, vl_chat_processor, prompt, H, W, cfg_weight=3.0, temperature=1.0, ar_row=1, do_sample=True)
         # row_parallel_token.append(generated_tokens.detach().cpu().numpy())
-        # generated_tokens = spec_row_parallel_logits(vl_gpt, vl_chat_processor, prompt, H, W, row_parallel=True, cfg_weight=3.0, temperature=1.0)
-        
+       
         # baseline_prob.append(bs_probs_all)
         # row_parallel_prob.append(pl_probs_all)
 
+        # generated_tokens = spec_row_parallel_logits(vl_gpt, vl_chat_processor, prompt, H, W, row_parallel=True, cfg_weight=3.0, temperature=1.0)
+        # generated_tokens = partial_row_parallel_logits(vl_gpt, vl_chat_processor, prompt, H, W, cfg_weight=3.0, temperature=1.0, row_batch_size=24)
+        
+        generated_tokens = row_parallel_experiments(vl_gpt, vl_chat_processor, prompt, H, W, cfg_weight=3.0, temperature=1.0, ar_row=1, rp_row=23,do_sample=True)
         dt = time.perf_counter() - t0
         
         img_size = 384
@@ -569,9 +951,16 @@ if __name__ == "__main__":
         save_path = os.path.join(save_dir, f"test_{datetime}.jpg")
         PIL.Image.fromarray(row).save(save_path)
     
-    # np.save(os.path.join(probe_dir, "baseline_prob.npy"), np.array(baseline_prob, dtype=np.float32))
-    # np.save(os.path.join(probe_dir, "row_parallel_prob.npy"), np.array(row_parallel_prob, dtype=np.float32))
-    # np.save(os.path.join(probe_dir, "baseline_token.npy"), np.array(baseline_token, dtype=np.int32))
-    # np.save(os.path.join(probe_dir, "row_parallel_token.npy"), np.array(row_parallel_token, dtype=np.int32))
+    if False:
+        np.save(os.path.join(probe_dir, "baseline_prob.npy"), np.array(baseline_prob, dtype=np.float32))
+        np.save(os.path.join(probe_dir, "row_parallel_prob.npy"), np.array(row_parallel_prob, dtype=np.float32))
+        np.save(os.path.join(probe_dir, "baseline_token.npy"), np.array(baseline_token, dtype=np.int32))
+        np.save(os.path.join(probe_dir, "row_parallel_token.npy"), np.array(row_parallel_token, dtype=np.int32))
 
         # torch.cuda.empty_cache()
+
+    if False:
+        np.save(os.path.join(probe_dir, "baseline_prob_sample20.npy"), np.array(baseline_prob, dtype=np.float32))
+        np.save(os.path.join(probe_dir, "row_parallel_prob_sample20.npy"), np.array(row_parallel_prob, dtype=np.float32))
+        np.save(os.path.join(probe_dir, "baseline_token_sample20.npy"), np.array(baseline_token, dtype=np.int32))
+        np.save(os.path.join(probe_dir, "row_parallel_token_sample20.npy"), np.array(row_parallel_token, dtype=np.int32))

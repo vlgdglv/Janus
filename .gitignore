@@ -1,9 +1,10 @@
 assets/
 generated_samples_with_probe/
-parrallel_test/
+parallel_test/
 probe_runtime/
-
-
+generated/
+eval_coco/data/
+*.ipynb
 ##### Python.gitignore #####
 # Byte-compiled / optimized / DLL files
 **/__pycache__/
